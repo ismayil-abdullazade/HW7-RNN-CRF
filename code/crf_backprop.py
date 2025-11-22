@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 # CS465 at Johns Hopkins University.
 # Subclass ConditionalRandomField to use PyTorch facilities.
 
@@ -6,16 +7,10 @@ from __future__ import annotations
 import logging
 import torch.nn as nn
 from pathlib import Path
-import time
 from typing_extensions import override
-import math
 
 import torch
 from torch import Tensor, cuda
-from jaxtyping import Float
-
-from corpus import Sentence, Tag, TaggedCorpus, Word
-from integerize import Integerizer
 from crf import ConditionalRandomField
 
 logger = logging.getLogger(Path(__file__).stem)  
@@ -24,10 +19,7 @@ cuda.manual_seed(69_420)
 
 class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
     @override
-    def __init__(self, 
-                 tagset: Integerizer[Tag],
-                 vocab: Integerizer[Word],
-                 unigram: bool = False):
+    def __init__(self, tagset, vocab, unigram=False):
         nn.Module.__init__(self)  
         super().__init__(tagset, vocab, unigram)
         self.count_params()
@@ -35,7 +27,7 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
         
     @override
     def init_params(self) -> None:
-        # Standard Initialization
+        # Init Parameters
         self.WB = nn.Parameter(torch.empty(self.k, self.V))
         nn.init.uniform_(self.WB, -0.01, 0.01)
         
@@ -43,10 +35,10 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
         self.WA = nn.Parameter(torch.empty(rows, self.k))
         nn.init.uniform_(self.WA, -0.01, 0.01)
 
-        # Robust Structural Zeroes Initialization
-        # We use -1e4 (logits) rather than -inf for stability before Softmax
+        # Structural Constraints (Init to valid logits, not -inf)
+        # We use -100.0: large enough to be rare after softmax, small enough to not break float32 gradients.
         with torch.no_grad():
-            large_neg = -1e4
+            large_neg = -100.0 
             self.WA[:, self.bos_t] = large_neg
             if not self.unigram:
                 self.WA[self.eos_t, :] = large_neg
@@ -57,39 +49,33 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
 
     @override
     def updateAB(self) -> None:
-        """
-        Compute A and B with extensive safety masking.
-        """
-        epsilon = 1e-45 # Prevents log(0) in HMM forward pass
+        # Use epsilon larger than float32 epsilon (approx 1e-38)
+        # 1e-20 ensures log(epsilon) is roughly -46, which is a healthy gradient range.
+        EPSILON = 1e-20 
+        LARGE_NEG_LOGIT = -1e4 
 
         # 1. Transition A
-        wa_logits = self.WA.clone()
-        # Masking: Force "Impossible" transitions to be effectively 0 probability
-        wa_logits[:, self.bos_t] = -1e9
+        wa_safe = self.WA.clone()
+        # Manual hard masking on logits
+        wa_safe[:, self.bos_t] = LARGE_NEG_LOGIT
         if not self.unigram:
-             wa_logits[self.eos_t, :] = -1e9 
-        
-        A_soft = wa_masked = wa_logits.softmax(dim=1)
-        if self.unigram:
-            A_soft = A_soft.repeat(self.k, 1)
-            
-        # 2. Emission B
-        wb_logits = self.WB.clone()
-        wb_logits[self.bos_t, :] = -1e9
-        wb_logits[self.eos_t, :] = -1e9
-        B_soft = wb_logits.softmax(dim=1)
+             wa_safe[self.eos_t, :] = LARGE_NEG_LOGIT 
 
-        # 3. Clamping
-        # If p=0, log(p) = -inf. This causes NaNs during gradient calculation (1/0).
-        # We clamp probability to epsilon.
-        self.A = torch.clamp(A_soft, min=epsilon)
-        self.B = torch.clamp(B_soft, min=epsilon)
+        A_soft = wa_safe.softmax(dim=1)
         
-        # DEBUG SAMPLER (1% of the time)
-        if torch.rand(1).item() < 0.01:
-            if torch.isnan(self.A).any(): logger.critical("NaN detected in A matrix inside updateAB")
-            if torch.isnan(self.B).any(): logger.critical("NaN detected in B matrix inside updateAB")
-            # logger.debug(f"A_stats: max={self.A.max().item():.2e}, min={self.A.min().item():.2e}")
+        # Clamp helps in case Softmax produces strict 0 due to underflow on the -1e4
+        self.A = torch.clamp(A_soft, min=EPSILON)
+        
+        if self.unigram:
+            self.A = self.A.repeat(self.k, 1)
+
+        # 2. Emission B
+        wb_safe = self.WB.clone()
+        wb_safe[self.bos_t, :] = LARGE_NEG_LOGIT
+        wb_safe[self.eos_t, :] = LARGE_NEG_LOGIT
+        
+        B_soft = wb_safe.softmax(dim=1)
+        self.B = torch.clamp(B_soft, min=EPSILON)
 
     def init_optimizer(self, lr: float, weight_decay: float) -> None:      
         self.optimizer = torch.optim.SGD(
@@ -102,7 +88,7 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
         logger.info(f"Parameters: {paramcount}")
 
     @override
-    def train(self, corpus: TaggedCorpus, *args, minibatch_size: int = 1, lr: float = 1.0, reg: float = 0.0, **kwargs) -> None:
+    def train(self, corpus, *args, minibatch_size=1, lr=1.0, reg=0.0, **kwargs) -> None:
         self.init_optimizer(lr=lr, weight_decay = 2 * reg * minibatch_size / len(corpus))
         super().train(corpus, *args, minibatch_size=minibatch_size, lr=lr, reg=reg, **kwargs)
 
@@ -112,72 +98,49 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
         self._batch_losses = []
 
     @override
-    def accumulate_logprob_gradient(self, sentence: Sentence, corpus: TaggedCorpus) -> None:
-        # Ensure A/B is fresh from parameters
+    def accumulate_logprob_gradient(self, sentence, corpus) -> None:
+        # Ensure A/B are attached to graph
         self.updateAB()
         
-        # Calculate Loss
+        # Calculate Loss (Forward Pass)
         logprob = self.logprob(sentence, corpus)
         
-        # Debug Checks
-        is_nan = torch.isnan(logprob)
-        is_inf = torch.isinf(logprob)
-        
-        if is_nan or is_inf:
-            if is_inf and logprob.item() < 0:
-                # This is Log(0) case. Forward pass calculated probability 0 for the supervised sentence.
-                # This means the parameters believe this sentence is Impossible.
-                # We must cap the loss or gradient will explode.
-                # logger.warning("LogProb is -inf (Prob 0). Clamping gradient source.")
-                safe_loss = torch.tensor(-1e5, device=logprob.device, requires_grad=True)
-                self._batch_losses.append(-safe_loss)
-                return
-            else:
-                logger.error(f"LogProb NaN/Inf detected! Value: {logprob.item()}")
-                # Fallback
-                self._batch_losses.append(torch.tensor(0.0, device=logprob.device, requires_grad=True))
-        else:
-            self._batch_losses.append(-logprob)
+        # Store negative logprob
+        # NOTE: If forward pass hit extreme instabilities, logprob might be inf or nan.
+        # We assume 1e-20 clamp fixed that. 
+        self._batch_losses.append(-logprob)
 
     @override
     def logprob_gradient_step(self, lr: float) -> None:
         if not self._batch_losses: return
         
-        # Sum minibatch loss
+        # Total batch loss
         minibatch_loss = torch.stack(self._batch_losses).sum()
         
-        if torch.isnan(minibatch_loss):
-            logger.critical("Minibatch Total Loss is NaN. Skipping update.")
+        # Safety Guard
+        if torch.isnan(minibatch_loss) or torch.isinf(minibatch_loss):
+            logger.warning("NaN/Inf loss detected. Resetting batch.")
             self._batch_losses = []
             self.optimizer.zero_grad()
             return
 
-        # Backward Pass
+        # Backward
         minibatch_loss.backward()
         
-        # Debug Gradients
-        has_nan = False
-        norm = 0.0
-        for n, p in self.named_parameters():
-            if p.grad is not None:
-                g_norm = p.grad.norm()
-                norm += g_norm.item() ** 2
-                if torch.isnan(p.grad).any():
-                    logger.warning(f"NaN gradient in {n}")
-                    has_nan = True
-        
-        if has_nan:
-            logger.critical("Skipping optimizer step due to NaN gradients.")
-            self.optimizer.zero_grad()
-            self._batch_losses = []
-            return
-
-        # Gradient Clipping (Essential for RNN/CRF stability)
+        # Gradient Clipping (Vital for preventing future NaNs)
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=5.0)
         
         self.optimizer.step()
         self._batch_losses = []
         
     @override
-    def reg_gradient_step(self, lr: float, reg: float, frac: float):
+    def reg_gradient_step(self, lr, reg, frac):
+        # Optimizer handles weight decay
         pass
+
+    def learning_speed(self, lr: float, minibatch_size: int) -> float:
+        try:
+            total_grad_norm = sum(torch.sum(p.grad**2).item() for p in self.parameters() if p.grad is not None)
+            return lr * total_grad_norm / minibatch_size
+        except:
+            return 0.0
