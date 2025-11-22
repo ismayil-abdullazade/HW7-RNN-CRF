@@ -7,7 +7,6 @@ from __future__ import annotations
 import logging
 import torch.nn as nn
 import torch.nn.functional as F
-from math import inf
 from pathlib import Path
 from typing_extensions import override
 from typeguard import typechecked
@@ -30,40 +29,56 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
     
     @override
     def __init__(self, tagset: Integerizer[Tag], vocab: Integerizer[Word], lexicon: Tensor, rnn_dim: int, unigram: bool = False):
-        if unigram: raise NotImplementedError("Not required for this homework")
+        if unigram: raise NotImplementedError("BiRNN-CRF requires bigram features (A_st)")
 
         self.rnn_dim = rnn_dim
-        self.E = lexicon
+        self.E = lexicon # Fixed embeddings (NumWords x EmbSize)
         self.e = lexicon.size(1)
         self.num_words = len(vocab)
-        self.phi_dim = 64  # Dimension for feature vectors f
+        
+        # Feature mixing dimensionality (internal hidden layer size for potentials)
+        self.phi_dim = 64
 
         nn.Module.__init__(self)  
+        # Note: super().__init__ will call init_params(), so self.E etc must be set before.
         super().__init__(tagset, vocab, unigram)
 
     @override
     def init_params(self) -> None:
-        """Initialize parameters for M, M', U_a, U_b, theta_a and theta_b."""
+        """Initialize parameters for M, M', U_a, U_b, theta_a and theta_b.
+        See Reading Handout Eq 46, 47, 48."""
         
-        # 1. Manual RNN Parameters (Handout Eq 46)
-        # M: Maps [1, h, w] -> h
+        # 1. Bi-Directional RNN Parameters (Handout Eq 46)
+        # We manually implement the RNN cells to control the inputs [1; h; w] exactly.
+        
+        # M: Maps [1, h, w] -> h (Forward)
+        # dim: output x input = d x (1 + d + e)
         self.M = nn.Parameter(torch.empty(self.rnn_dim, 1 + self.rnn_dim + self.e))
-        # M': Maps [1, w, h'] -> h'
+        
+        # M': Maps [1, w, h'] -> h' (Backward)
+        # dim: output x input = d x (1 + e + d)
         self.M_prime = nn.Parameter(torch.empty(self.rnn_dim, 1 + self.e + self.rnn_dim))
         
         # 2. Transition Feature MLP (Handout Eq 47)
-        # U_A maps [1, h, s, t, h'] -> f (phi_dim)
+        # U_A maps [1, h_{i-2}, s, t, h'_i] -> f_A (phi_dim)
+        # Inputs: Bias(1) + h_prev(d) + tag_s(k) + tag_t(k) + h_next(d)
+        # Note: We treat tags as one-hot, effectively embedding them.
         dim_UA = 1 + 2*self.rnn_dim + 2*self.k
         self.U_A = nn.Parameter(torch.empty(self.phi_dim, dim_UA))
+        
+        # Weight vector Theta_A to project f_A -> log potential
         self.Theta_A = nn.Parameter(torch.empty(self.phi_dim))
         
         # 3. Emission Feature MLP (Handout Eq 48)
-        # U_B maps [1, h, t, w, h'] -> f (phi_dim)
+        # U_B maps [1, h_{i-1}, t, w, h'_i] -> f_B (phi_dim)
+        # Inputs: Bias(1) + h_prev(d) + tag_t(k) + word(e) + h_next(d)
         dim_UB = 1 + 2*self.rnn_dim + self.k + self.e
         self.U_B = nn.Parameter(torch.empty(self.phi_dim, dim_UB))
+        
+        # Weight vector Theta_B to project f_B -> log potential
         self.Theta_B = nn.Parameter(torch.empty(self.phi_dim))
         
-        # Init: Xavier Uniform for Matrices, Normal for Thetas
+        # Init strategy: Xavier Uniform for Weights, Normal for Thetas
         for p in [self.M, self.M_prime, self.U_A, self.U_B]:
             nn.init.xavier_uniform_(p)
         for p in [self.Theta_A, self.Theta_B]:
@@ -71,128 +86,185 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
 
     @override
     def init_optimizer(self, lr: float, weight_decay: float) -> None:
+        # Per instructions Step 0 notes / Reading: Neural Nets usually prefer AdamW
         self.optimizer = torch.optim.AdamW(params=self.parameters(), lr=lr, weight_decay=weight_decay)       
        
     @override
     def updateAB(self) -> None:
-        pass # A and B are dynamic in this subclass
+        # We don't update static A/B matrices in the neural model. 
+        # A_at and B_at calculate them dynamically.
+        pass 
 
     @override
     def setup_sentence(self, isent: IntegerizedSentence) -> None:
-        """Pre-compute manual RNN states h and h'."""
+        """Pre-compute the manual RNN states h (forward) and h' (backward) for the sentence.
+        This 'Eager' approach (Instructions Step 4) prevents O(L^2) re-computation."""
         
         dev = next(self.parameters()).device
         if self.E.device != dev: self.E = self.E.to(dev)
         
-        word_idx = torch.tensor([w for w, t in isent], dtype=torch.long, device=dev)
-        embs = F.embedding(word_idx, self.E) # L x e
+        word_indices = torch.tensor([w for w, t in isent], dtype=torch.long, device=dev)
+        word_embs = F.embedding(word_indices, self.E) # L x e
         
         L = len(isent)
         d = self.rnn_dim
         
-        # 1. Forward Scan (M)
-        # h_j depends on w_j and h_{j-1}.
-        m_bias, m_h, m_w = self.M[:,0], self.M[:, 1:d+1], self.M[:, d+1:]
+        # --- 1. Forward Scan (M) ---
+        # Computes h_0 ... h_{L-1} where h_j uses prefix w_0...w_j
+        # Eq 46: h_j = sigma(M @ [1; h_{j-1}; w_j])
+        # We initialize h_{-1} as 0
         
-        h = torch.zeros(d, device=dev) # h_{-1}
+        m_bias = self.M[:, 0]           # (d,)
+        m_h    = self.M[:, 1:d+1]       # (d, d)
+        m_w    = self.M[:, d+1:]        # (d, e)
+        
+        h = torch.zeros(d, device=dev)  # h_{-1}
         h_fw = []
         for j in range(L):
-            act = m_bias + (m_h @ h) + (m_w @ embs[j])
+            # Activation: bias + Mh * h + Mw * w
+            act = m_bias + (m_h @ h) + (m_w @ word_embs[j])
             h = torch.sigmoid(act)
             h_fw.append(h)
-        self.ctx_forward = torch.stack(h_fw) # indices 0..L-1 maps to h_0..h_{L-1}
+        self.ctx_forward = torch.stack(h_fw) # Size (L, d). index j -> h_j
 
-        # 2. Backward Scan (M')
-        # h'_{j-1} depends on w_j and h'_j. 
-        # Storage: index i in ctx_backward maps to h'_i. Size L+1.
-        mp_bias, mp_w, mp_hp = self.M_prime[:,0], self.M_prime[:, 1:e+1], self.M_prime[:, e+1:]
+        # --- 2. Backward Scan (M') ---
+        # Computes h'_0 ... h'_{L-1} where h'_{j-1} depends on w_j, h'_j
+        # Note: We store this such that accessing index i gives h'_i (the vector *after* word i)
+        # Wait - let's align with Eq 46 exactly: h'_{j-1} = sigma(M' @ [1; w_j; h'_j])
+        # Base case: h'_n = 0 (represented as state L in our dense storage)
+        
+        mp_bias = self.M_prime[:, 0]        # (d,)
+        mp_w    = self.M_prime[:, 1:e+1]    # (d, e)
+        mp_hp   = self.M_prime[:, e+1:]     # (d, d)
         e = self.e
-        mp_bias = self.M_prime[:, 0]
-        mp_w = self.M_prime[:, 1:e+1]
-        mp_hp = self.M_prime[:, e+1:]
 
-        h_bw_dense = torch.zeros((L + 1, d), device=dev) # initialized with h'_L = 0
+        h_bw_dense = torch.zeros((L + 1, d), device=dev) # index L = h'_L = 0
         
         for j in range(L - 1, -1, -1):
-            # Computing h'_{j}? No, formula is h'_{j-1} based on h'_j.
-            # h_bw_dense[j+1] holds h'_{j+1} ? No notation is tricky.
-            # Let's stick to reading convention:
-            # h'_j (suffix starting at w_{j+1}) depends on w_{j+1} and h'_{j+1}.
-            # My loop j is decreasing.
-            # Let's say we compute vector just BEFORE w_j. That is h'_{j-1} in reading.
-            # It depends on w_j and vector AFTER w_j (which is h'_j).
+            # Calculating h' just before word w_j (i.e. h'_{j-1})
+            # It uses w_j and h' just after word w_j (h'_j)
             
-            hp_next = h_bw_dense[j+1] # This represents vector after w_j
-            w_vec = embs[j]
+            hp_next = h_bw_dense[j+1] # This corresponds to h'_j
+            w_vec = word_embs[j]
             
             act = mp_bias + (mp_w @ w_vec) + (mp_hp @ hp_next)
+            
+            # Store result at index j (effectively h'_{j-1}) 
+            # Careful: convention says h'_i is suffix after word i. 
+            # The calculation loop generates "Vector left of w_j" based on "Vector right of w_j".
             h_bw_dense[j] = torch.sigmoid(act)
             
         self.ctx_backward = h_bw_dense
+        # Map: ctx_backward[i] gives h'_i. 
+        # Check: ctx_backward[0] was computed using w_0 and ctx_backward[1]. 
+        # This represents vector left of w_0. i.e. h'_{-1}.
+        # So accessing [i] gives vector *left* of word i.
+        self.embedded_sentence = word_embs
 
     @override
     def accumulate_logprob_gradient(self, sentence: Sentence, corpus: TaggedCorpus) -> None:
+        # Ensure lexicon operations are on the right device if moved
         isent = self._integerize_sentence(sentence, corpus)
+        # Precompute biRNN vectors for this specific sentence
+        self.setup_sentence(isent) 
+        # Call parent to run forward pass
         super().accumulate_logprob_gradient(sentence, corpus)
 
     @override
     @typechecked
     def A_at(self, position: int, sentence) -> Tensor:
+        """Compute non-stationary transition matrix A at position i."""
         i = position; dev = self.E.device
         
-        # Inputs
+        # Inputs according to Eq 47: h_{i-2} and h'_i
+        # Be careful with indices. Position i in Viterbi usually means transitioning to tag at i.
+        # (Tag sequence indices usually 1-based in math, but 0-based in list).
+        # h_{i-2}: if i < 2, use zero.
+        
         h_p = self.ctx_forward[i-2] if i >= 2 else torch.zeros(self.rnn_dim, device=dev)
-        h_s = self.ctx_backward[i] # valid up to L
         
-        # Decompose Weights for Broadcasting: Bias + Dot(W, Input)
-        d = self.rnn_dim
-        k = self.k
-        u_bias = self.U_A[:, 0]
-        u_hp = self.U_A[:, 1:d+1]
-        u_s  = self.U_A[:, d+1 : d+1+k]
-        u_t  = self.U_A[:, d+1+k : d+1+2*k]
-        u_hs = self.U_A[:, d+1+2*k:]
+        # h'_i: Context AFTER the bigram? 
+        # If bigram is t_{i-1} -> t_i. This occurs across words w_{i-1}, w_i.
+        # We need context to the right of word i? Or right of i-1?
+        # Footnote 32: "prefix... h_{i-2}... suffix h'_i".
+        # Our backward array stores "vector left of word k" at index k.
+        # So we need vector to the right of word i-1. Which is left of word i.
+        # That is ctx_backward[i]. 
+        if i < len(self.ctx_backward):
+            h_s = self.ctx_backward[i] 
+        else:
+            h_s = torch.zeros(self.rnn_dim, device=dev)
+
+        # U_A layout: bias | h_p | s | t | h_s
+        d = self.rnn_dim; k = self.k
+        u_bias = self.U_A[:, 0]                 # (phi,)
+        u_hp   = self.U_A[:, 1:d+1]             # (phi, d)
+        u_s    = self.U_A[:, d+1 : d+1+k]       # (phi, k)
+        u_t    = self.U_A[:, d+1+k : d+1+2*k]   # (phi, k)
+        u_hs   = self.U_A[:, d+1+2*k:]          # (phi, d)
         
-        # Constants
-        base = u_bias + (u_hp @ h_p) + (u_hs @ h_s) # (phi,)
+        # Compute constant part (doesn't depend on s,t tags)
+        base = u_bias + (u_hp @ h_p) + (u_hs @ h_s) # Shape (phi,)
         
-        # Tag Parts
-        # u_s (phi, k).T -> (k, phi). View (k, 1, phi)
-        # u_t (phi, k).T -> (k, phi). View (1, k, phi)
-        term_s = u_s.T.unsqueeze(1)
+        # Tag Parts: Use Broadcasting to compute for all (s, t) pairs at once
+        # u_s: weights for tag s. Shape (phi, k). Transpose -> (k, phi). Reshape (k, 1, phi)
+        term_s = u_s.T.unsqueeze(1) 
+        
+        # u_t: weights for tag t. Shape (phi, k). Transpose -> (k, phi). Reshape (1, k, phi)
         term_t = u_t.T.unsqueeze(0)
         
-        f = torch.sigmoid(base.view(1,1,-1) + term_s + term_t) # KxKxPhi
-        log_A = (f * self.Theta_A.view(1,1,-1)).sum(dim=-1)
+        # Add everything: (1,1,phi) + (k,1,phi) + (1,k,phi) -> (k, k, phi)
+        f_A = torch.sigmoid(base.view(1,1,-1) + term_s + term_t) 
+        
+        # Dot product with Theta_A: (k,k,phi) * (1,1,phi) -> sum last dim -> (k,k)
+        log_A = (f_A * self.Theta_A.view(1,1,-1)).sum(dim=-1)
+        
+        # Exponentiate to get potential (unnormalized prob)
         return torch.exp(log_A)
 
     @override
     @typechecked
     def B_at(self, position: int, sentence) -> Tensor:
+        """Compute non-stationary emission matrix B at position i.
+        Optimized: only computes column for the actual observed word w."""
+        
         i = position; dev = self.E.device
         w_idx = sentence[i][0]
-        if i >= len(self.ctx_forward): return torch.zeros(self.k, w_idx+2, device=dev)
-
-        h_p = self.ctx_forward[i-1] if i>=1 else torch.zeros(self.rnn_dim, device=dev)
-        h_s = self.ctx_backward[i]
-        w_vec = self.embedded_sentence[i] # precomputed in setup
+        
+        # Eq 48 inputs: h_{i-1}, w_vec, h'_i
+        h_p = self.ctx_forward[i-1] if i >= 1 else torch.zeros(self.rnn_dim, device=dev)
+        h_s = self.ctx_backward[i] if i < len(self.ctx_backward) else torch.zeros(self.rnn_dim, device=dev)
+        w_vec = self.embedded_sentence[i]
         
         d=self.rnn_dim; k=self.k; e=self.e
-        # U_B splits: bias(1) + hp(d) + t(k) + w(e) + hs(d)
-        curr = 1
-        u_bias = self.U_B[:, 0]
-        u_hp   = self.U_B[:, curr:curr+d]; curr+=d
-        u_t    = self.U_B[:, curr:curr+k]; curr+=k
-        u_w    = self.U_B[:, curr:curr+e]; curr+=e
+        
+        # U_B layout: bias | hp | t | w | hs
+        curr = 0
+        u_bias = self.U_B[:, curr]; curr += 1
+        u_hp   = self.U_B[:, curr : curr+d]; curr += d
+        u_t    = self.U_B[:, curr : curr+k]; curr += k
+        u_w    = self.U_B[:, curr : curr+e]; curr += e
         u_hs   = self.U_B[:, curr:]
         
-        base = u_bias + (u_hp @ h_p) + (u_w @ w_vec) + (u_hs @ h_s)
+        # Constant parts (dep on context and word, not tag)
+        # bias + hp@h_p + w@w_vec + hs@h_s
+        base = u_bias + (u_hp @ h_p) + (u_w @ w_vec) + (u_hs @ h_s) # (phi,)
+        
+        # Tag part: (phi, k)
         term_t = u_t.T # (k, phi)
         
-        f = torch.sigmoid(base.unsqueeze(0) + term_t)
-        scores = torch.exp( (f * self.Theta_B.view(1, -1)).sum(dim=-1) )
+        # Sigmoid(Base + term_t). Broadcasting (1, phi) + (k, phi)
+        f_B = torch.sigmoid(base.unsqueeze(0) + term_t) # (k, phi)
         
-        valid_V = max(w_idx+1, self.num_words+2)
-        B_out = torch.zeros((self.k, valid_V), device=dev)
+        # Theta dot product
+        log_scores = (f_B * self.Theta_B.view(1, -1)).sum(dim=-1) # (k,)
+        scores = torch.exp(log_scores)
+        
+        # Construct B matrix (K x V). Only the column for w_idx is filled.
+        # Instructions allow B_at to effectively return potentials for the specific position.
+        B_out = torch.zeros((self.k, self.num_words), device=dev)
+        # B_out is huge/sparse? Just fill the column for the observed word.
+        # This implies the parent class calls B[:, word] at some point.
+        # Or checks A_at/B_at
         B_out[:, w_idx] = scores
         return B_out

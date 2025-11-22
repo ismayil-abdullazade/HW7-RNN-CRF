@@ -30,16 +30,19 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
                  tagset: Integerizer[Tag],
                  vocab: Integerizer[Word],
                  unigram: bool = False):
+        # Need to initialize nn.Module logic
         nn.Module.__init__(self)  
         super().__init__(tagset, vocab, unigram)
+        
         self.count_params()
-        self._batch_losses = []
+        self._batch_losses = [] # Store individual sentence losses here
         
     @override
     def init_params(self) -> None:
-        # Define parameters WA and WB.
-        # We assume dimensions based on vocab and tagset.
-        
+        """
+        Initialize global stationary parameters WA and WB (used if not using Neural/RNN).
+        """
+        # Simple linear chain params
         self.WB = nn.Parameter(torch.empty(self.k, self.V))
         nn.init.uniform_(self.WB, -0.01, 0.01)
         
@@ -47,8 +50,8 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
         self.WA = nn.Parameter(torch.empty(rows, self.k))
         nn.init.uniform_(self.WA, -0.01, 0.01)
 
-        # Initialize Structural Zeroes to neg large number for softmasking later
-        # (Gradient friendly alternative to -inf)
+        # Initialize Structural Zeroes to neg large number 
+        # We use masking later, but this helps numerical stability
         with torch.no_grad():
             self.WA[:, self.bos_t] = -999
             if not self.unigram:
@@ -62,20 +65,24 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
     def updateAB(self) -> None:
         """
         Compute A and B using softmax.
-        CRITICAL: Avoids in-place operations (like A[x]=0) to satisfy PyTorch Autograd.
-        Uses masking instead.
+        CRITICAL FIX: Use an epsilon (1e-45) instead of 0.0 for masking.
+        log(0) -> -inf, which creates NaNs in gradients (grad = 1/x = 1/0).
         """
+        EPSILON = 1e-45 
+
         # 1. Transition Matrix A
         # self.WA is unnormalized logits.
         A_soft = self.WA.softmax(dim=1)
         
         # Mask structural zeroes
+        # Instead of A_soft * mask_A (which makes 0), we perform mixing
         mask_A = torch.ones_like(A_soft)
-        mask_A[:, self.bos_t] = 0  # No transition to BOS
+        mask_A[:, self.bos_t] = 0
         if not self.unigram:
-             mask_A[self.eos_t, :] = 0 # EOS has no outgoing transitions
+             mask_A[self.eos_t, :] = 0 
         
-        self.A = A_soft * mask_A
+        # Apply Mask: Keep soft value where mask is 1, put EPSILON where mask is 0
+        self.A = A_soft * mask_A + EPSILON * (1 - mask_A)
 
         # 2. Emission Matrix B
         B_soft = self.WB.softmax(dim=1)
@@ -84,9 +91,11 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
         mask_B[self.bos_t, :] = 0
         mask_B[self.eos_t, :] = 0
         
-        self.B = B_soft * mask_B
+        # Apply Mask with Epsilon
+        self.B = B_soft * mask_B + EPSILON * (1 - mask_B)
 
     def init_optimizer(self, lr: float, weight_decay: float) -> None:      
+        # Standard SGD for stationary model
         self.optimizer = torch.optim.SGD(
             params=self.parameters(), 
             lr=lr, weight_decay=weight_decay
@@ -102,8 +111,10 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
 
     @override
     def train(self, corpus: TaggedCorpus, *args, minibatch_size: int = 1, lr: float = 1.0, reg: float = 0.0, **kwargs) -> None:
+        # Reset optimizer
         self.init_optimizer(lr=lr, weight_decay = 2 * reg * minibatch_size / len(corpus))
         self._save_time = time.time() 
+        # Parent train calls the below override hooks
         super().train(corpus, *args, minibatch_size=minibatch_size, lr=lr, reg=reg, **kwargs)
 
     @override        
@@ -114,19 +125,23 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
     @override
     def accumulate_logprob_gradient(self, sentence: Sentence, corpus: TaggedCorpus) -> None:
         """Compute logprob and append to batch list. """
-        # Important: Update A/B from the current parameters WA/WB for this batch step.
-        # Otherwise the computation graph is stale.
+        # Recalculate A/B if parameters changed (rebuilds graph)
+        # Note: in BiRNN-CRF this method is 'pass', but needed for base model.
         self.updateAB()
         
-        # We minimize negative log likelihood
+        # Minimize negative log likelihood
+        # Note: This returns a scalar Tensor if implemented with PyTorch
         logprob = self.logprob(sentence, corpus)
+        
+        # Store negative logprob for minimization
         self._batch_losses.append(-logprob)
 
     @override
     def logprob_gradient_step(self, lr: float) -> None:
         if not self._batch_losses: return
         
-        # Single backward pass for the whole batch
+        # Accumulate gradient for the ENTIRE batch at once.
+        # This solves the "Backward through graph twice" issue mentioned in Instructions.
         minibatch_loss = torch.stack(self._batch_losses).sum()
         minibatch_loss.backward()
         
@@ -135,10 +150,11 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
         
     @override
     def reg_gradient_step(self, lr: float, reg: float, frac: float):
-        # L2 Regularization handled by optimizer
+        # L2 Regularization is handled by optimizer weight_decay
         pass
 
     def learning_speed(self, lr: float, minibatch_size: int) -> float:
+        # Helper to track gradient magnitude
         try:
             return lr * sum(torch.sum(p.grad * p.grad).item() 
                             for p in self.parameters() if p.grad is not None) / minibatch_size
