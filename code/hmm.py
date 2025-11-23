@@ -240,7 +240,7 @@ class HiddenMarkovModel:
             
             # (k,1) + (k,k) + (1,k) broadcasting
             log_scores = log_alpha[j-1].unsqueeze(1) + log_A + log_B_col.unsqueeze(0)
-            log_alpha[j] = torch.logsumexp(log_scores, dim=0) 
+            log_alpha[j] = torch.logsumexp(log_scores, dim=0, safe_inf=True) 
             
             if t_j is not None:
                 mask = torch.full((self.k,), float('-inf'))
@@ -286,7 +286,7 @@ class HiddenMarkovModel:
                 mask[t_next] = 0.0
                 log_scores = log_scores + mask.unsqueeze(0) 
             
-            log_beta[j] = torch.logsumexp(log_scores, dim=1)
+            log_beta[j] = torch.logsumexp(log_scores, dim=1, safe_inf=True)
         
         log_Z_backward = log_beta[0][self.bos_t]
         
@@ -428,7 +428,7 @@ class HiddenMarkovModel:
                 mask[t_next] = 0.0
                 log_scores = log_scores + mask.unsqueeze(0)
             
-            log_beta[j] = torch.logsumexp(log_scores, dim=1)
+            log_beta[j] = torch.logsumexp(log_scores, dim=1, safe_inf=True)
         
         if old_A_counts is not None: self.A_counts = old_A_counts
         if old_B_counts is not None: self.B_counts = old_B_counts
