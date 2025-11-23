@@ -20,7 +20,7 @@ from jaxtyping import Float
 # Import safe logsumexp to handle -inf in backprop
 import logsumexp_safe  # patches torch.logsumexp to handle -inf correctly
 
-from corpus import IntegerizedSentence, Sentence, Tag, TaggedCorpus, Word
+from corpus import IntegerizedSentence, Sentence, Tag, TaggedCorpus, Word, BOS_WORD, EOS_WORD
 from integerize import Integerizer
 from crf_backprop import ConditionalRandomFieldBackprop, TorchScalar
 
@@ -103,6 +103,28 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
         self.theta_b = nn.Parameter(torch.empty(self.k))
         nn.init.zeros_(self.theta_b)
         
+        # Precompute constants that don't change during training (use register_buffer so they move to GPU)
+        # One-hot tag embeddings (identity matrix) - computed once
+        self.register_buffer('tag_embeddings', torch.eye(self.k))
+        
+        # Precompute masks for structural zeros (avoid log(0))
+        # A_mask: can't transition TO bos or FROM eos
+        A_mask = torch.ones(self.k, self.k)
+        A_mask[:, self.bos_t] = 1e-10
+        A_mask[self.eos_t, :] = 1e-10
+        self.register_buffer('A_mask', A_mask)
+        
+        # B_mask: eos and bos can't emit regular words
+        B_mask = torch.ones(self.k)
+        B_mask[self.eos_t] = 1e-10
+        B_mask[self.bos_t] = 1e-10
+        self.register_buffer('B_mask', B_mask)
+        
+        # Cache for RNN hidden states
+        self.h = None
+        self.h_prime = None
+        self._rnn_cache_key = None
+        
     @override
     def init_optimizer(self, lr: float, weight_decay: float) -> None:
         # [docstring will be inherited from parent]
@@ -180,71 +202,46 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
     @override
     @typechecked
     def A_at(self, position, sentence) -> Tensor:
-        
         """Computes non-stationary k x k transition potential matrix using biRNN 
         contextual features and tag embeddings (one-hot encodings). Output should 
-        be ϕA from the "Parameterization" section in the reading handout."""
-
+        be ϕA from the "Parameterization" section in the reading handout.
+        
+        Optimized for speed: fully vectorized, no loops, precomputed constants."""
+        
         j = position
         
-        # Get biRNN context at position j
+        # Get precomputed biRNN context at position j
         h_j = self.h[j]
         h_prime_j = self.h_prime[j]
         context = torch.cat([h_j, h_prime_j])  # (2*rnn_dim,)
         
-        # Use one-hot tag embeddings (identity matrix)
-        tag_embeddings = torch.eye(self.k)  # (k, k)
+        # Create feature vectors for all k^2 (s,t) pairs efficiently
+        # Strategy: broadcast and stack operations to avoid explicit loops
         
-        # For each pair (s, t), concatenate [context, embed(s), embed(t)]
-        # This creates a k x k matrix
-        # We need to compute this efficiently using broadcasting
+        # Expand context to (k, k, 2*rnn_dim) - same for all pairs
+        context_exp = context.view(1, 1, -1).expand(self.k, self.k, -1)
         
-        # Expand context to (k, k, 2*rnn_dim) by repeating
-        context_expanded = context.unsqueeze(0).unsqueeze(0).expand(self.k, self.k, -1)
-        
-        # Expand tag embeddings: s varies over rows, t varies over columns
-        tag_s = tag_embeddings.unsqueeze(1).expand(-1, self.k, -1)  # (k, k, k) - embed(s) for each (s,t)
-        tag_t = tag_embeddings.unsqueeze(0).expand(self.k, -1, -1)  # (k, k, k) - embed(t) for each (s,t)
+        # Tag embeddings: use precomputed identity matrix
+        # For (s, t): need embed(s) and embed(t)
+        # embed(s): repeat each row k times (vary t)
+        # embed(t): repeat each column k times (vary s)
+        tag_s = self.tag_embeddings.unsqueeze(1).expand(-1, self.k, -1)  # (k, k, k)
+        tag_t = self.tag_embeddings.unsqueeze(0).expand(self.k, -1, -1)  # (k, k, k)
         
         # Concatenate all features: [context, tag_s, tag_t]
-        features = torch.cat([context_expanded, tag_s, tag_t], dim=2)  # (k, k, 2*rnn_dim + k + k)
+        features = torch.cat([context_exp, tag_s, tag_t], dim=2)  # (k, k, feature_dim)
         
-        # Reshape for matrix multiplication
-        features_flat = features.view(self.k * self.k, -1)  # (k^2, 2*rnn_dim + k + k)
+        # Reshape to (k^2, feature_dim) for batch processing
+        features_flat = features.reshape(self.k * self.k, -1)
         
-        # Compute potentials: sigmoid(U_a @ features + theta_a)
-        logits = features_flat @ self.U_a.t() + self.theta_a  # (k^2, k^2) @ (k^2, features) -> (k^2,)
-        # Wait, U_a is (k^2, features), so U_a @ features^T gives us (k^2,) for each of k^2 pairs
-        # Actually, we want: for each (s,t) pair, compute one potential value
+        # Compute potentials using matrix multiplication: sigmoid(U_a @ features^T + theta_a)
+        # U_a is (k^2, feature_dim), features_flat is (k^2, feature_dim)
+        # We want element-wise: U_a[i] · features_flat[i] for each i
+        logits = (self.U_a * features_flat).sum(dim=1) + self.theta_a  # (k^2,)
+        potentials = torch.sigmoid(logits)
         
-        # Let me reconsider: U_a should map features to a single scalar per (s,t) pair
-        # U_a: (k^2, feature_dim) - NO, that's wrong
-        # U_a should be (1, feature_dim) to map features -> scalar, but we have k^2 pairs
-        # OR U_a maps each feature vector to a scalar, so we need U_a to be applied k^2 times
-        
-        # Actually, from the handout equation 45: we compute one potential per (s,t) pair
-        # So U_a should give us k^2 outputs from k^2 input feature vectors
-        # This means U_a maps feature_dim -> 1, and we apply it k^2 times
-        
-        # Let me fix this: U_a should be (1, feature_dim) OR we use linear layer
-        # Actually, each (s,t) pair gets its own row in U_a
-        
-        # Reinterpret: U_a is (k^2, feature_dim), theta_a is (k^2,)
-        # For input features (k^2, feature_dim), we compute:
-        # output[i] = U_a[i] @ features[i] + theta_a[i]
-        
-        logits = torch.sum(self.U_a * features_flat, dim=1) + self.theta_a  # (k^2,)
-        potentials = torch.sigmoid(logits)  # (k^2,)
-        
-        # Reshape to k x k matrix
-        phi_A = potentials.view(self.k, self.k)
-        
-        # Enforce structural zeros by creating a mask and multiplying
-        # Add small epsilon to avoid exact zeros which can cause log(0) = -inf issues
-        mask = torch.ones(self.k, self.k)
-        mask[:, self.bos_t] = 1e-10
-        mask[self.eos_t, :] = 1e-10
-        phi_A = phi_A * mask
+        # Reshape to k x k matrix and apply precomputed mask
+        phi_A = potentials.view(self.k, self.k) * self.A_mask
         
         return phi_A
         
@@ -253,12 +250,14 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
     def B_at(self, position, sentence) -> Tensor:
         """Computes non-stationary k x V emission potential matrix using biRNN 
         contextual features, tag embeddings (one-hot encodings), and word embeddings. 
-        Output should be ϕB from the "Parameterization" section in the reading handout."""
-
+        Output should be ϕB from the "Parameterization" section in the reading handout.
+        
+        Optimized for speed: fully vectorized, precomputed constants."""
+        
         j = position
         w_j, _ = sentence[j]
         
-        # Get biRNN context at position j
+        # Get precomputed biRNN context at position j
         h_j = self.h[j]
         h_prime_j = self.h_prime[j]
         context = torch.cat([h_j, h_prime_j])  # (2*rnn_dim,)
@@ -269,35 +268,36 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
         else:
             word_emb = torch.zeros(self.e)
         
-        # Use one-hot tag embeddings
-        tag_embeddings = torch.eye(self.k)  # (k, k)
-        
-        # For each tag t, concatenate [context, embed(t), word_emb]
-        # This creates a k-dimensional vector (one potential per tag for this specific word)
+        # Create feature vectors for all k tags efficiently
+        # For each tag t: [context, embed(t), word_emb]
         
         # Expand context to (k, 2*rnn_dim)
-        context_expanded = context.unsqueeze(0).expand(self.k, -1)
+        context_exp = context.unsqueeze(0).expand(self.k, -1)
         
         # Expand word embedding to (k, e)
-        word_emb_expanded = word_emb.unsqueeze(0).expand(self.k, -1)
+        word_emb_exp = word_emb.unsqueeze(0).expand(self.k, -1)
         
-        # Concatenate features for each tag: [context, tag_emb[t], word_emb]
-        features = torch.cat([context_expanded, tag_embeddings, word_emb_expanded], dim=1)  # (k, 2*rnn_dim + k + e)
+        # Concatenate: use precomputed tag_embeddings instead of torch.eye()
+        features = torch.cat([context_exp, self.tag_embeddings, word_emb_exp], dim=1)  # (k, feature_dim)
         
-        # Compute potentials: sigmoid(U_b @ features + theta_b)
-        # U_b: (k, feature_dim), features: (k, feature_dim)
-        # For each tag t: U_b[t] @ features[t] + theta_b[t]
-        logits = torch.sum(self.U_b * features, dim=1) + self.theta_b  # (k,)
-        potentials = torch.sigmoid(logits)  # (k,)
+        # Compute potentials: sigmoid(U_b @ features^T + theta_b)
+        # U_b is (k, feature_dim), features is (k, feature_dim)
+        # Element-wise: U_b[t] · features[t] for each tag t
+        logits = (self.U_b * features).sum(dim=1) + self.theta_b  # (k,)
+        potentials = torch.sigmoid(logits) * self.B_mask  # Apply precomputed mask
         
-        # Enforce structural zeros by masking before creating the full matrix
-        # Use small epsilon instead of exact zero to avoid log(0) issues
-        mask = torch.ones(self.k)
-        mask[self.eos_t] = 1e-10
-        mask[self.bos_t] = 1e-10
-        potentials = potentials * mask
+        # Return k x V matrix: we only have potentials for one word (w_j)
+        # Note: V is the size of the REGULAR vocabulary (excluding BOS/EOS)
+        # But w_j might be >= V if it's BOS or EOS
+        phi_B = torch.full((self.k, self.V), float('-inf'))
         
-        # We need to return a k x V matrix, but we only computed potentials for one word
+        # Only set potentials if w_j is in the regular vocabulary
+        if w_j < self.V:
+            phi_B[:, w_j] = potentials
+        # Note: for BOS/EOS, they are handled by the forward/backward algorithms
+        # which use special logic for these positions
+        
+        return phi_B
         # The CRF code expects B[t, w] format, so we create a full matrix with this column
         phi_B = torch.zeros(self.k, self.V)
         if w_j < self.V:

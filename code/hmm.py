@@ -15,6 +15,9 @@ import torch
 from torch import Tensor, cuda, nn
 from jaxtyping import Float
 
+# Import safe logsumexp to handle -inf in backprop
+import logsumexp_safe  # patches torch.logsumexp to handle -inf correctly
+
 from tqdm import tqdm # type: ignore
 import pickle
 
