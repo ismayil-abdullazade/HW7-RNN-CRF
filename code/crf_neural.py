@@ -107,6 +107,14 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
         # One-hot tag embeddings (identity matrix) - computed once
         self.register_buffer('tag_embeddings', torch.eye(self.k))
         
+        # Precompute expanded tag embeddings for A_at() to avoid repeated expansions
+        # tag_s: (k, k, k) - for each (s,t) pair, embed(s)
+        # tag_t: (k, k, k) - for each (s,t) pair, embed(t)
+        tag_s = self.tag_embeddings.unsqueeze(1).expand(-1, self.k, -1)
+        tag_t = self.tag_embeddings.unsqueeze(0).expand(self.k, -1, -1)
+        self.register_buffer('tag_s_expanded', tag_s)
+        self.register_buffer('tag_t_expanded', tag_t)
+        
         # Precompute masks for structural zeros (avoid log(0))
         # A_mask: can't transition TO bos or FROM eos
         A_mask = torch.ones(self.k, self.k)
@@ -147,47 +155,35 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
         vectors) at all positions, as defined in the "Parameterization" section
         of the reading handout.  They can then be accessed by A_at() and B_at().
         
-        Make sure to call this method from the forward_pass, backward_pass, and
-        Viterbi_tagging methods of HiddenMarkovMOdel, so that A_at() and B_at()
-        will have correct precomputed values to look at!"""
+        Optimized: Uses batched matrix operations where possible.
+        """
 
         # Cache based on sentence identity to avoid recomputation
-        # Use tuple of word indices as cache key (tags don't affect RNN computation)
         cache_key = tuple(w for w, _ in isent)
         if hasattr(self, '_rnn_cache_key') and self._rnn_cache_key == cache_key:
             return  # Already computed for this sentence
         
         n = len(isent)
         
-        # Initialize h vectors (forward RNN) - use zeros that support gradients
+        # Get all word embeddings at once (batch operation)
+        word_indices = torch.tensor([w for w, _ in isent], dtype=torch.long)
+        
+        # Create embedding matrix: use E for known words, zeros for unknown
+        embeddings = torch.zeros(n, self.e)
+        valid_mask = word_indices < len(self.E)
+        if valid_mask.any():
+            embeddings[valid_mask] = self.E[word_indices[valid_mask]]
+        
+        # Forward RNN: Still need sequential computation due to recurrence
+        # But we can optimize the loop
         h = [torch.zeros(self.rnn_dim) for _ in range(n)]
-        
-        # Forward pass: compute h_j from h_{j-1} and word embedding at position j
         for j in range(1, n):
-            w_j, _ = isent[j]
-            # Get word embedding
-            if w_j < len(self.E):
-                x_j = self.E[w_j]
-            else:
-                x_j = torch.zeros(self.e)
-            
-            # h_j = tanh(M @ x_j + h_{j-1})
-            h[j] = torch.tanh(self.M @ x_j + h[j-1])
+            h[j] = torch.tanh(self.M @ embeddings[j] + h[j-1])
         
-        # Initialize h' vectors (backward RNN)
+        # Backward RNN: Also sequential
         h_prime = [torch.zeros(self.rnn_dim) for _ in range(n)]
-        
-        # Backward pass: compute h'_j from h'_{j+1} and word embedding at position j
         for j in range(n-2, -1, -1):
-            w_j, _ = isent[j]
-            # Get word embedding
-            if w_j < len(self.E):
-                x_j = self.E[w_j]
-            else:
-                x_j = torch.zeros(self.e)
-            
-            # h'_j = tanh(M' @ x_j + h'_{j+1})
-            h_prime[j] = torch.tanh(self.M_prime @ x_j + h_prime[j+1])
+            h_prime[j] = torch.tanh(self.M_prime @ embeddings[j] + h_prime[j+1])
         
         # Store for use by A_at() and B_at()
         self.h = h
@@ -215,28 +211,17 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
         h_prime_j = self.h_prime[j]
         context = torch.cat([h_j, h_prime_j])  # (2*rnn_dim,)
         
-        # Create feature vectors for all k^2 (s,t) pairs efficiently
-        # Strategy: broadcast and stack operations to avoid explicit loops
-        
         # Expand context to (k, k, 2*rnn_dim) - same for all pairs
         context_exp = context.view(1, 1, -1).expand(self.k, self.k, -1)
         
-        # Tag embeddings: use precomputed identity matrix
-        # For (s, t): need embed(s) and embed(t)
-        # embed(s): repeat each row k times (vary t)
-        # embed(t): repeat each column k times (vary s)
-        tag_s = self.tag_embeddings.unsqueeze(1).expand(-1, self.k, -1)  # (k, k, k)
-        tag_t = self.tag_embeddings.unsqueeze(0).expand(self.k, -1, -1)  # (k, k, k)
-        
+        # Use precomputed tag embeddings (already expanded in constructor)
         # Concatenate all features: [context, tag_s, tag_t]
-        features = torch.cat([context_exp, tag_s, tag_t], dim=2)  # (k, k, feature_dim)
+        features = torch.cat([context_exp, self.tag_s_expanded, self.tag_t_expanded], dim=2)  # (k, k, feature_dim)
         
         # Reshape to (k^2, feature_dim) for batch processing
         features_flat = features.reshape(self.k * self.k, -1)
         
-        # Compute potentials using matrix multiplication: sigmoid(U_a @ features^T + theta_a)
-        # U_a is (k^2, feature_dim), features_flat is (k^2, feature_dim)
-        # We want element-wise: U_a[i] · features_flat[i] for each i
+        # Compute potentials: sigmoid(U_a @ features^T + theta_a)
         logits = (self.U_a * features_flat).sum(dim=1) + self.theta_a  # (k^2,)
         potentials = torch.sigmoid(logits)
         
