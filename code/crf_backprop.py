@@ -198,29 +198,12 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
                 return  # Skip this update
             
             self._minibatch_loss.backward()
-        
-        # Check for NaN in gradients
-        has_nan = False
-        for name, param in self.named_parameters():
-            if param.grad is not None and torch.isnan(param.grad).any():
-                logger.warning(f"NaN detected in gradient of {name}")
-                has_nan = True
-        
-        if has_nan:
-            # Zero out gradients and skip this update
-            self.optimizer.zero_grad()
-            return
-        
+
         # Clip gradients to prevent explosion (more aggressive for neural models)
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
         
         # Take an optimizer step
         self.optimizer.step()
-        
-        # Check for NaN in parameters after update
-        for name, param in self.named_parameters():
-            if torch.isnan(param).any():
-                logger.warning(f"NaN detected in parameter {name} after update!")
 
         
     @override
