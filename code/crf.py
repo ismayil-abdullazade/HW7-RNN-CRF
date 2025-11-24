@@ -87,14 +87,15 @@ class ConditionalRandomField(HiddenMarkovModel):
         # See init_params() in the parent class for discussion of this point.
         
         # Convert weights to potentials using exp
-        self.B = torch.exp(self.WB)
+        # Use .clone() to avoid in-place modification issues during backprop
+        self.B = torch.exp(self.WB).clone()
         
         if self.unigram:
             # For unigram: repeat the single row k times to make a full matrix
-            self.A = torch.exp(self.WA).repeat(self.k, 1)
+            self.A = torch.exp(self.WA).repeat(self.k, 1).clone()
         else:
             # For bigram: direct conversion
-            self.A = torch.exp(self.WA)
+            self.A = torch.exp(self.WA).clone()
         
         # Ensure structural zeros remain (exp(-inf) = 0)
         self.A[:, self.bos_t] = 0
