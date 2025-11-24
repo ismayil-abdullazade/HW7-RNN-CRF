@@ -142,9 +142,11 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
 
         # Look up how to do this with a PyTorch optimizer!
         self.optimizer.zero_grad()
-        # Also reset the minibatch loss accumulator
-        if hasattr(self, '_minibatch_loss'):
-            del self._minibatch_loss
+        # Also reset the minibatch loss accumulator (use a list to avoid graph issues)
+        self._minibatch_losses = []
+        # Clear RNN cache to prevent using freed computation graphs
+        if hasattr(self, '_rnn_cache_key'):
+            delattr(self, '_rnn_cache_key')
 
     @override
     def accumulate_logprob_gradient(self, sentence: Sentence, corpus: TaggedCorpus) -> None:
@@ -175,12 +177,12 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
             logger.warning(f"Error computing logprob: {e}")
             return  # Skip this sentence
         
-        # Accumulate this into minibatch loss (stored as instance variable)
-        # We'll call backward() on the total minibatch loss later
-        if not hasattr(self, '_minibatch_loss'):
-            self._minibatch_loss = -logprob
-        else:
-            self._minibatch_loss = self._minibatch_loss - logprob
+        # Accumulate losses in a list to avoid keeping entire computation graph
+        # We'll sum and backward at the end of the minibatch
+        if not hasattr(self, '_minibatch_losses'):
+            self._minibatch_losses = []
+        
+        self._minibatch_losses.append(-logprob)
 
     @override
     def logprob_gradient_step(self, lr: float) -> None:
@@ -191,14 +193,17 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
         # of the accumulated gradient.
         
         # First, backpropagate through the accumulated minibatch loss
-        if hasattr(self, '_minibatch_loss'):
+        if hasattr(self, '_minibatch_losses') and len(self._minibatch_losses) > 0:
+            # Sum all losses in the minibatch - this creates a fresh computation graph
+            minibatch_loss = sum(self._minibatch_losses)
+            
             # Check if loss is NaN before backprop
-            if torch.isnan(self._minibatch_loss):
+            if torch.isnan(minibatch_loss):
                 logger.warning("NaN detected in minibatch loss before backprop!")
                 return  # Skip this update
             
-            self._minibatch_loss.backward()
-
+            minibatch_loss.backward()
+        
         # Clip gradients to prevent explosion (more aggressive for neural models)
         torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
         
