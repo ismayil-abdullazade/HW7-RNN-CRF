@@ -126,6 +126,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     modelgroup.add_argument(
+        "--affixes",
+        action="store_true",
+        default=False,
+        help="neuralized model (HW7) with affix features (prefixes and suffixes) for better generalization"
+    )
+
+    modelgroup.add_argument(
         "-a",
         "--awesome",
         action="store_true",
@@ -334,11 +341,12 @@ def main() -> None:
                 lexicon = build_lexicon(train_corpus, 
                                         embeddings_file=Path(args.lexicon) if args.lexicon else None, 
                                         newvocab=TaggedCorpus(Path(args.input)).vocab,  # add only eval words from file
-                                        problex=args.problex)
+                                        problex=args.problex,
+                                        affixes=args.affixes)
             else:
                 # No lexicon was specified, so default to simpler embeddings of the training words.
-                if args.problex:
-                    lexicon = build_lexicon(train_corpus, problex=args.problex)
+                if args.problex or args.affixes:
+                    lexicon = build_lexicon(train_corpus, problex=args.problex, affixes=args.affixes)
                 else:
                     # Simple one-hot embeddings are our final fallback if nothing else was specified.
                     lexicon = build_lexicon(train_corpus, one_hot=True)
