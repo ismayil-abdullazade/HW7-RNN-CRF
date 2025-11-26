@@ -487,7 +487,7 @@ class HiddenMarkovModel:
     @classmethod
     def load(cls, path: Path|str, device: str = 'cpu') -> HiddenMarkovModel:
         if isinstance(path, str): path = Path(path)   
-        model = torch.load(path, map_location=device)
+        model = torch.load(path, map_location=device, weights_only=False)
 
         if not isinstance(model, cls):
             raise ValueError(f"Type Error: expected object of type {cls.__name__} but got {model.__class__.__name__} " \
