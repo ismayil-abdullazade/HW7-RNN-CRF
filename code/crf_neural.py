@@ -46,7 +46,8 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
                  vocab: Integerizer[Word],
                  lexicon: Tensor,
                  rnn_dim: int,
-                 unigram: bool = False):
+                 unigram: bool = False,
+                 init_scale: Optional[float] = None):
         # [doctring inherited from parent method]
 
         if unigram:
@@ -55,6 +56,7 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
         self.rnn_dim = rnn_dim
         self.e = lexicon.size(1) # dimensionality of word's embeddings
         self.E = lexicon
+        self.init_scale = init_scale
 
         nn.Module.__init__(self)  
         super().__init__(tagset, vocab, unigram)
@@ -69,6 +71,13 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
             and theta_b. Use xavier uniform initialization for the matrices and 
             normal initialization for the vectors. 
         """
+        if self.init_scale is not None:
+            scale = self.init_scale
+            logger.info(f"Using init_scale={scale} (user-specified)")
+        else:
+            is_toy = (self.V <= 5 and self.k <= 5)
+            scale = 1.0 if is_toy else 0.3
+            logger.info(f"Auto-detected {'toy' if is_toy else 'real'} dataset; using init_scale={scale}")
 
         # See the "Parameterization" section of the reading handout to determine
         # what dimensions all your parameters will need.
@@ -86,7 +95,7 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
         self.U_a = nn.Parameter(torch.empty(self.k * self.k, 2 * self.rnn_dim + self.k + self.k))
         nn.init.xavier_uniform_(self.U_a)
         # Scale down to prevent explosion
-        self.U_a.data *= 0.1
+        self.U_a.data *= scale
         
         # theta_a: bias for transition potentials (k^2 dimensional)
         self.theta_a = nn.Parameter(torch.empty(self.k * self.k))
@@ -97,7 +106,7 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
         self.U_b = nn.Parameter(torch.empty(self.k, 2 * self.rnn_dim + self.k + self.e))
         nn.init.xavier_uniform_(self.U_b)
         # Scale down to prevent explosion
-        self.U_b.data *= 0.1
+        self.U_b.data *= scale
         
         # theta_b: bias for emission potentials (k dimensional)
         self.theta_b = nn.Parameter(torch.empty(self.k))
@@ -269,22 +278,13 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
         # U_b is (k, feature_dim), features is (k, feature_dim)
         # Element-wise: U_b[t] · features[t] for each tag t
         logits = (self.U_b * features).sum(dim=1) + self.theta_b  # (k,)
-        potentials = torch.sigmoid(logits) * self.B_mask  # Apply precomputed mask
+        potentials = torch.sigmoid(logits) * self.B_mask  # Apply precomputed mask, shape (k,)
         
-        # Return k x V matrix: we only have potentials for one word (w_j)
-        # Note: V is the size of the REGULAR vocabulary (excluding BOS/EOS)
-        # But w_j might be >= V if it's BOS or EOS
-        phi_B = torch.full((self.k, self.V), float('-inf'))
+        # Return k x V matrix with potentials for word w_j
+        # Use 0 (not -inf) since potentials are in probability space
+        phi_B = torch.zeros(self.k, self.V)
         
         # Only set potentials if w_j is in the regular vocabulary
-        if w_j < self.V:
-            phi_B[:, w_j] = potentials
-        # Note: for BOS/EOS, they are handled by the forward/backward algorithms
-        # which use special logic for these positions
-        
-        return phi_B
-        # The CRF code expects B[t, w] format, so we create a full matrix with this column
-        phi_B = torch.zeros(self.k, self.V)
         if w_j < self.V:
             phi_B[:, w_j] = potentials
         

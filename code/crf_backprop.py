@@ -205,7 +205,7 @@ class ConditionalRandomFieldBackprop(ConditionalRandomField, nn.Module):
             minibatch_loss.backward()
         
         # Clip gradients to prevent explosion (more aggressive for neural models)
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=5.0)
         
         # Take an optimizer step
         self.optimizer.step()
