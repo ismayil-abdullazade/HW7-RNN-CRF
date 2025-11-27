@@ -208,10 +208,7 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
     @typechecked
     def A_at(self, position, sentence) -> Tensor:
         """Computes non-stationary k x k transition potential matrix using biRNN 
-        contextual features and tag embeddings (one-hot encodings). Output should 
-        be ϕA from the "Parameterization" section in the reading handout.
-        
-        Optimized for speed: fully vectorized, no loops, precomputed constants."""
+        contextual features and tag embeddings (one-hot encodings)."""
         
         j = position
         
@@ -230,12 +227,16 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
         # Reshape to (k^2, feature_dim) for batch processing
         features_flat = features.reshape(self.k * self.k, -1)
         
-        # Compute potentials: sigmoid(U_a @ features^T + theta_a)
+        # Compute log-potentials (unbounded)
         logits = (self.U_a * features_flat).sum(dim=1) + self.theta_a  # (k^2,)
-        potentials = torch.sigmoid(logits)
         
-        # Reshape to k x k matrix and apply precomputed mask
-        phi_A = potentials.view(self.k, self.k) * self.A_mask
+        # Reshape to k x k matrix and apply structural zeros in log-space
+        logits_matrix = logits.view(self.k, self.k)
+        logits_matrix[:, self.bos_t] = float('-inf')
+        logits_matrix[self.eos_t, :] = float('-inf')
+        
+        # Exponentiate to get potentials
+        phi_A = torch.exp(logits_matrix)
         
         return phi_A
         
@@ -243,10 +244,7 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
     @typechecked
     def B_at(self, position, sentence) -> Tensor:
         """Computes non-stationary k x V emission potential matrix using biRNN 
-        contextual features, tag embeddings (one-hot encodings), and word embeddings. 
-        Output should be ϕB from the "Parameterization" section in the reading handout.
-        
-        Optimized for speed: fully vectorized, precomputed constants."""
+        contextual features, tag embeddings (one-hot encodings), and word embeddings."""
         
         j = position
         w_j, _ = sentence[j]
@@ -274,14 +272,17 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
         # Concatenate: use precomputed tag_embeddings instead of torch.eye()
         features = torch.cat([context_exp, self.tag_embeddings, word_emb_exp], dim=1)  # (k, feature_dim)
         
-        # Compute potentials: sigmoid(U_b @ features^T + theta_b)
-        # U_b is (k, feature_dim), features is (k, feature_dim)
-        # Element-wise: U_b[t] · features[t] for each tag t
+        # Compute log-potentials (unbounded)
         logits = (self.U_b * features).sum(dim=1) + self.theta_b  # (k,)
-        potentials = torch.sigmoid(logits) * self.B_mask  # Apply precomputed mask, shape (k,)
+        
+        # Apply structural zeros in log-space
+        logits[self.eos_t] = float('-inf')
+        logits[self.bos_t] = float('-inf')
+        
+        # Exponentiate to get potentials
+        potentials = torch.exp(logits)  # (k,)
         
         # Return k x V matrix with potentials for word w_j
-        # Use 0 (not -inf) since potentials are in probability space
         phi_B = torch.zeros(self.k, self.V)
         
         # Only set potentials if w_j is in the regular vocabulary
