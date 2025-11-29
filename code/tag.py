@@ -220,6 +220,13 @@ def parse_args() -> argparse.Namespace:
         help="how often to evaluate the model (after training on this many sentences) (default 2000)"
     )
 
+    crfgroup.add_argument(
+        "--init_scale",
+        type=float,
+        default=None,
+        help="initialization scale for neural CRF parameters (default: 1.0 for toy, 0.1 for real datasets)"
+    )
+
     args = parser.parse_args()
 
     ### Any arg manipulation and checking goes here
@@ -271,8 +278,12 @@ def parse_args() -> argparse.Namespace:
             args.new_model_class = HiddenMarkovModel
     else:                   # create some sort of CRF
         if args.rnn_dim or args.lexicon or args.problex:
-            from crf_neural import ConditionalRandomFieldNeural  # module provided with hw-rnn homework
-            args.new_model_class = ConditionalRandomFieldNeural
+            if args.awesome:
+                from crf_awesome import ConditionalRandomFieldAwesome
+                args.new_model_class = ConditionalRandomFieldAwesome
+            else:
+                from crf_neural import ConditionalRandomFieldNeural  # module provided with hw-rnn homework
+                args.new_model_class = ConditionalRandomFieldNeural
         else: 
             args.new_model_class = ConditionalRandomField          
 
@@ -354,7 +365,7 @@ def main() -> None:
             # Now create the model.
             model = new_model_class(train_corpus.tagset, train_corpus.vocab, 
                                     rnn_dim=(args.rnn_dim or 0), lexicon=lexicon,   # neural model args
-                                    unigram=args.unigram)
+                                    unigram=args.unigram, init_scale=args.init_scale)
     
     # Load the input data (eval corpus), using the same vocab and tagset.
     eval_corpus = TaggedCorpus(Path(args.input), tagset=model.tagset, vocab=model.vocab)
