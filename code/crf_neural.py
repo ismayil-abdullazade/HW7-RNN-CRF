@@ -76,7 +76,7 @@ class ConditionalRandomFieldNeural(ConditionalRandomFieldBackprop):
             logger.info(f"Using init_scale={scale} (user-specified)")
         else:
             is_toy = (self.V <= 5 and self.k <= 5)
-            scale = 1.0 if is_toy else 0.3
+            scale = 1.0 if is_toy else 0.1
             logger.info(f"Auto-detected {'toy' if is_toy else 'real'} dataset; using init_scale={scale}")
 
         # See the "Parameterization" section of the reading handout to determine
